@@ -1,0 +1,91 @@
+# Reusable workflow: build a container image and push it to Google Artifact
+# Registry, authenticated keylessly via Workload Identity Federation (no
+# service-account keys). The calling repo's own GitHub OIDC identity is the push
+# principal, so it can push only where it has been granted artifactregistry.writer.
+#
+# Usage — .github/workflows/build-push.yml in the calling repo:
+#
+#   on:
+#     push: { branches: [main] }
+#   jobs:
+#     image:
+#       uses: elastic/ebc-hosting-actions/.github/workflows/build-push-image.yml@v1
+#       permissions: { contents: read, id-token: write }
+#       with:
+#         ar_repo: <artifact-registry-repo>
+#         image: <image-name>
+#         project: <gcp-project>
+#         wif_provider: <workload-identity-provider-resource-name>
+name: build-push-image
+
+on:
+  workflow_call:
+    inputs:
+      ar_repo:
+        description: "Artifact Registry repository id."
+        required: true
+        type: string
+      image:
+        description: "Image name within the repository."
+        required: true
+        type: string
+      project:
+        description: "GCP project id."
+        required: true
+        type: string
+      wif_provider:
+        description: "Full Workload Identity provider resource name."
+        required: true
+        type: string
+      region:
+        description: "Artifact Registry region."
+        required: false
+        default: "us-west1"
+        type: string
+      context:
+        description: "Docker build context."
+        required: false
+        default: "."
+        type: string
+      dockerfile:
+        description: "Path to the Dockerfile."
+        required: false
+        default: "Dockerfile"
+        type: string
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required to mint the GitHub OIDC token for WIF
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          # Direct WIF — no service_account: the federated identity itself holds
+          # the artifactregistry.writer role on the target repository.
+          workload_identity_provider: ${{ inputs.wif_provider }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure docker for Artifact Registry
+        env:
+          REGION: ${{ inputs.region }}
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push
+        env:
+          IMAGE_BASE: ${{ inputs.region }}-docker.pkg.dev/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}
+          SHA: ${{ github.sha }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+        run: |
+          docker buildx build \
+            --tag "${IMAGE_BASE}:${SHA}" \
+            --tag "${IMAGE_BASE}:latest" \
+            --file "${DOCKERFILE}" \
+            --push \
+            "${CONTEXT}"
