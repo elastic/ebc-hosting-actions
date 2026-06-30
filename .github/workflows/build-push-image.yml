@@ -1,17 +1,9 @@
-# Reusable build + push workflow for EBC/GPS hosting-platform source repos.
+# Reusable workflow: build a container image and push it to Google Artifact
+# Registry, authenticated keylessly via Workload Identity Federation (no
+# service-account keys). The calling repo's own GitHub OIDC identity is the push
+# principal, so it can push only where it has been granted artifactregistry.writer.
 #
-# A built workload's CI calls this to build its image and push it to ITS Image
-# Repository, keylessly via Workload Identity Federation — no service-account keys.
-# The push principal is the calling repo's own GitHub OIDC identity, which holds
-# artifactregistry.writer on its own AR repo only (e.g. gps-owner-repo), so it
-# cannot touch any other workload's images.
-#
-# This repo is PUBLIC so any repo in ANY GitHub org can `uses:` it — that is the
-# whole point (a private repo's reusable workflow is not callable cross-org). The
-# decision and its security rationale live in the platform repo's
-# docs/adr/0010-reusable-build-workflow-in-public-repo.md.
-#
-# Usage (in your source repo, .github/workflows/build-push.yml):
+# Usage — .github/workflows/build-push.yml in the calling repo:
 #
 #   on:
 #     push: { branches: [main] }
@@ -19,23 +11,36 @@
 #     image:
 #       uses: elastic/ebc-hosting-actions/.github/workflows/build-push-image.yml@v1
 #       permissions: { contents: read, id-token: write }
-#       with: { ar_repo: <tenant>-<owner>-<repo>, image: <image> }
-#
-# The platform must have onboarded your repo first (a manifest.yaml with
-# `repo: <owner>/<repo>` merged to main), which creates your Image Repository and
-# grants your repo push access to it (and only it).
+#       with:
+#         ar_repo: <artifact-registry-repo>
+#         image: <image-name>
+#         project: <gcp-project>
+#         wif_provider: <workload-identity-provider-resource-name>
 name: build-push-image
 
 on:
   workflow_call:
     inputs:
       ar_repo:
-        description: "Image Repository id (e.g. gps-jrphifer-video-search)."
+        description: "Artifact Registry repository id."
         required: true
         type: string
       image:
-        description: "Image name inside the AR repo (e.g. video-search)."
+        description: "Image name within the repository."
         required: true
+        type: string
+      project:
+        description: "GCP project id."
+        required: true
+        type: string
+      wif_provider:
+        description: "Full Workload Identity provider resource name."
+        required: true
+        type: string
+      region:
+        description: "Artifact Registry region."
+        required: false
+        default: "us-west1"
         type: string
       context:
         description: "Docker build context."
@@ -46,21 +51,6 @@ on:
         description: "Path to the Dockerfile."
         required: false
         default: "Dockerfile"
-        type: string
-      region:
-        description: "Artifact Registry region."
-        required: false
-        default: "us-west1"
-        type: string
-      project:
-        description: "GCP project."
-        required: false
-        default: "elastic-ce-tools"
-        type: string
-      wif_provider:
-        description: "Full Workload Identity provider resource name."
-        required: false
-        default: "projects/14485593664/locations/global/workloadIdentityPools/github-demos/providers/github"
         type: string
 
 jobs:
@@ -76,7 +66,7 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           # Direct WIF — no service_account: the federated identity itself holds
-          # artifactregistry.writer on this repo's AR repo.
+          # the artifactregistry.writer role on the target repository.
           workload_identity_provider: ${{ inputs.wif_provider }}
 
       - uses: google-github-actions/setup-gcloud@v2

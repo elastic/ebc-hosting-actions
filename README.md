@@ -1,14 +1,9 @@
 # ebc-hosting-actions
 
-Shared CI for the EBC/GPS hosting platform. This repo is **public** so source repos
-in **any** GitHub org can call its reusable workflow — a private repo's reusable
-workflow is not callable cross-org, and that is the reason this lives on its own.
+Reusable GitHub Actions workflow to build a container image and push it to Google
+Artifact Registry using keyless Workload Identity Federation.
 
 ## `build-push-image.yml`
-
-Builds a workload's container and pushes it to its Artifact Registry Image Repository
-keylessly via Workload Identity Federation (no service-account keys). Call it from your
-source repo once the platform has onboarded you:
 
 ```yaml
 # .github/workflows/build-push.yml
@@ -19,23 +14,21 @@ jobs:
     uses: elastic/ebc-hosting-actions/.github/workflows/build-push-image.yml@v1
     permissions: { contents: read, id-token: write }
     with:
-      ar_repo: <tenant>-<owner>-<repo>   # your Image Repository id
-      image: <image>                     # image name inside it
+      ar_repo: <artifact-registry-repo>
+      image: <image-name>
+      project: <gcp-project>
+      wif_provider: <workload-identity-provider-resource-name>
 ```
 
-Optional inputs (with defaults): `context` (`.`), `dockerfile` (`Dockerfile`),
-`region` (`us-west1`), `project` (`elastic-ce-tools`), `wif_provider`.
+Required inputs: `ar_repo`, `image`, `project`, `wif_provider`. Optional inputs (with
+defaults): `region` (`us-west1`), `context` (`.`), `dockerfile` (`Dockerfile`).
 
 Pin `@v1` (a moving major tag) to get fixes automatically, or an immutable `@vX.Y.Z`
 for reproducibility.
 
 ## Security
 
-This workflow exposes identifiers (project, region, WIF provider name), not access:
-push is authorised by a per-repo Artifact Registry writer binding and the GitHub-signed
-`repository` OIDC claim, neither of which the workflow's contents can grant. The full
-rationale is in the platform repo's
-[ADR 0010](https://github.com/elastic/ebc-hosting-platform/blob/main/docs/adr/0010-reusable-build-workflow-in-public-repo.md).
-
-Because consumers run this repo's code via `@v1`, it is part of their build's trust
-boundary: protect `main` with required review and publish immutable version tags.
+Authentication is keyless via Workload Identity Federation — there are no secrets in
+this repository. The workflow can push only where the calling repository's federated
+identity has already been granted `artifactregistry.writer`; the workflow's contents
+grant no access on their own.
