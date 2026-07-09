@@ -69,13 +69,44 @@ jobs:
           # the artifactregistry.writer role on the target repository.
           workload_identity_provider: ${{ inputs.wif_provider }}
 
+      # setup-gcloud installs the SDK and *then* runs `gcloud auth login
+      # --cred-file`. That login performs the STS token exchange, which
+      # intermittently answers:
+      #
+      #   ('Unable to retrieve Identity Pool subject token',
+      #    'upstream connect error or disconnect/reset before headers.
+      #     reset reason: overflow')
+      #
+      # A transient failure there produces no image, which is silent: the caller's
+      # `main` stays green while the platform goes on serving the previously
+      # published digest. Tolerate the action's own login failing — it installs the
+      # SDK before attempting it, so gcloud exists either way — and let the next
+      # step own the login, with retries.
       - uses: google-github-actions/setup-gcloud@v2
+        continue-on-error: true
 
-      - name: Configure docker for Artifact Registry
+      - name: Authenticate to Artifact Registry (retry the flaky STS exchange)
         env:
           REGION: ${{ inputs.region }}
-        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          CREDS: ${{ steps.auth.outputs.credentials_file_path }}
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4 5; do
+            if gcloud auth login --quiet --cred-file="${CREDS}" \
+              && gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet; then
+              echo "Authenticated on attempt ${attempt}."
+              exit 0
+            fi
+            backoff=$((attempt * 15))
+            echo "::warning::Artifact Registry auth failed (attempt ${attempt}/5); retrying in ${backoff}s"
+            sleep "${backoff}"
+          done
+          echo "::error::Could not authenticate to Artifact Registry after 5 attempts."
+          exit 1
 
+      # Retried for the same reason as the login: the push is the other network hop
+      # whose loss is silent. Rebuilds hit the layer cache, so a retry costs the
+      # push rather than the build.
       - name: Build and push
         env:
           IMAGE_BASE: ${{ inputs.region }}-docker.pkg.dev/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}
@@ -83,9 +114,59 @@ jobs:
           DOCKERFILE: ${{ inputs.dockerfile }}
           CONTEXT: ${{ inputs.context }}
         run: |
-          docker buildx build \
-            --tag "${IMAGE_BASE}:${SHA}" \
-            --tag "${IMAGE_BASE}:latest" \
-            --file "${DOCKERFILE}" \
-            --push \
-            "${CONTEXT}"
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if docker buildx build \
+              --tag "${IMAGE_BASE}:${SHA}" \
+              --tag "${IMAGE_BASE}:latest" \
+              --file "${DOCKERFILE}" \
+              --push \
+              "${CONTEXT}"; then
+              echo "Pushed on attempt ${attempt}."
+              exit 0
+            fi
+            backoff=$((attempt * 20))
+            echo "::warning::Image push failed (attempt ${attempt}/3); retrying in ${backoff}s"
+            sleep "${backoff}"
+          done
+          echo "::error::Could not push the image after 3 attempts."
+          exit 1
+
+      # Retries make a lost image rarer, not impossible — and a lost image is
+      # invisible from the platform side: the workload simply keeps running its
+      # previous digest. Say plainly what just happened, in the run's annotations
+      # and its summary.
+      #
+      # This workflow cannot open an Issue on the caller's behalf: a called workflow's
+      # GITHUB_TOKEN permissions "can only be maintained or reduced — not elevated"
+      # relative to the caller's, and callers grant only `contents: read` and
+      # `id-token: write`. Requiring `issues: write` here would break every existing
+      # `@v1` caller. Repos that want an Issue add a notify job on their own side —
+      # see the README.
+      - name: Report that the image was not published
+        if: failure()
+        env:
+          IMAGE_BASE: ${{ inputs.region }}-docker.pkg.dev/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}
+          SHA: ${{ github.sha }}
+        run: |
+          echo "::error title=Image not published — this workload is now stale::No image was pushed for ${SHA}. The platform keeps serving the previously published digest until a later commit publishes successfully."
+          {
+            echo "## Image not published — this workload is now stale"
+            echo
+            echo "No image was pushed for \`${SHA}\`, so the platform keeps serving the"
+            echo "**previously published digest**. Deploying a fix requires a successful push;"
+            echo "a green \`main\` does not mean the running workload contains this commit."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${SHA}\` |"
+            echo "| Image | \`${IMAGE_BASE}\` |"
+            echo
+            echo "**To recover:** re-run this job. A later commit that publishes cleanly also"
+            echo "heals it, because its image contains this commit as an ancestor — but nothing"
+            echo "guarantees a later commit arrives."
+            echo
+            echo "If the failure was \`Unable to retrieve Identity Pool subject token\` /"
+            echo "\`reset reason: overflow\`, that is a transient Workload Identity Federation"
+            echo "fault, not a misconfiguration. The auth step already retries it five times."
+          } >> "${GITHUB_STEP_SUMMARY}"
