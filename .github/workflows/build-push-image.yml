@@ -136,11 +136,12 @@ jobs:
       # Artifact Registry answers a caller without access with PERMISSION_DENIED "(or
       # it may not exist)" rather than NOT_FOUND, so before merge this is the answer to
       # expect, and both are waited on. It relies on the writer role on the repository
-      # also allowing `artifactregistry.repositories.get` for the Direct WIF principalSet.
-      # That is expected (the writer role includes the reader permissions) but has not
-      # been confirmed for a principalSet. If it proves false, every build would wait out
-      # the timeout and fail here, so the timeout message names the escape hatch
-      # (`wait_for_repository_minutes: 0`) whenever the last answer was a denial.
+      # also allowing `artifactregistry.repositories.get`: it does (`gcloud iam roles
+      # describe roles/artifactregistry.writer` lists it, checked 2026-09-23), and IAM
+      # evaluates a principalSet member like any other, so an onboarded repo's identity
+      # can describe its repository. The timeout message still names the escape hatch
+      # (`wait_for_repository_minutes: 0`) whenever the last answer was a denial, for
+      # the case where a binding is missing rather than merely propagating.
       - name: Wait for the Image Repository
         id: preflight
         if: ${{ inputs.wait_for_repository_minutes > 0 }}
