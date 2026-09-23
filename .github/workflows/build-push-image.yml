@@ -3,10 +3,11 @@
 # service-account keys). The calling repo's own GitHub OIDC identity is the push
 # principal, so it can push only where it has been granted artifactregistry.writer.
 #
-# Usage — .github/workflows/build-push.yml in the calling repo:
+# Usage: .github/workflows/build-push.yml in the calling repo:
 #
 #   on:
 #     push: { branches: [main] }
+#     workflow_dispatch:   # a Run workflow button, for re-running after onboarding
 #   jobs:
 #     image:
 #       uses: elastic/ebc-hosting-actions/.github/workflows/build-push-image.yml@v1
@@ -52,10 +53,29 @@ on:
         required: false
         default: "Dockerfile"
         type: string
+      wait_for_repository_minutes:
+        description: >-
+          How long to wait, before building, for the Image Repository to become
+          reachable by this repo's identity. Polled every 30 seconds. 0 disables the check.
+        required: false
+        default: 10
+        type: number
+    outputs:
+      digest:
+        description: >-
+          Digest (sha256:...) the registry serves for the pushed image. Empty if the push
+          succeeded but the digest could not be read back.
+        value: ${{ jobs.build-push.outputs.digest }}
+      image:
+        description: "Image path without tag or digest: <region>-docker.pkg.dev/<project>/<ar_repo>/<image>."
+        value: ${{ jobs.build-push.outputs.image }}
 
 jobs:
   build-push:
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+      image: ${{ steps.digest.outputs.image }}
     permissions:
       contents: read
       id-token: write   # required to mint the GitHub OIDC token for WIF
@@ -65,7 +85,7 @@ jobs:
       - id: auth
         uses: google-github-actions/auth@v2
         with:
-          # Direct WIF — no service_account: the federated identity itself holds
+          # Direct WIF, no service_account: the federated identity itself holds
           # the artifactregistry.writer role on the target repository.
           workload_identity_provider: ${{ inputs.wif_provider }}
 
@@ -79,8 +99,8 @@ jobs:
       #
       # A transient failure there produces no image, which is silent: the caller's
       # `main` stays green while the platform goes on serving the previously
-      # published digest. Tolerate the action's own login failing — it installs the
-      # SDK before attempting it, so gcloud exists either way — and let the next
+      # published digest. Tolerate the action's own login failing (it installs the
+      # SDK before attempting it, so gcloud exists either way) and let the next
       # step own the login, with retries.
       - uses: google-github-actions/setup-gcloud@v2
         continue-on-error: true
@@ -102,6 +122,132 @@ jobs:
             sleep "${backoff}"
           done
           echo "::error::Could not authenticate to Artifact Registry after 5 attempts."
+          exit 1
+
+      # The Image Repository and this repo's writer binding are created by the hosting
+      # platform only after the PR that onboards the workload merges. A build that runs
+      # before then builds the image, pushes every layer, and is refused at the manifest
+      # three times over, several minutes later, with an error that cannot tell "not
+      # created yet" from any other denial. Check first, wait a bounded time for a
+      # repository or binding that is still being created or propagating, and fail
+      # before the build with a message that says what to do.
+      #
+      # `repositories describe` is a permission probe as much as an existence check.
+      # Artifact Registry answers a caller without access with PERMISSION_DENIED "(or
+      # it may not exist)" rather than NOT_FOUND, so before merge this is the answer to
+      # expect, and both are waited on. It relies on the writer role on the repository
+      # also allowing `artifactregistry.repositories.get` for the Direct WIF principalSet.
+      # That is expected (the writer role includes the reader permissions) but has not
+      # been confirmed for a principalSet. If it proves false, every build would wait out
+      # the timeout and fail here, so the timeout message names the escape hatch
+      # (`wait_for_repository_minutes: 0`) whenever the last answer was a denial.
+      - name: Wait for the Image Repository
+        id: preflight
+        if: ${{ inputs.wait_for_repository_minutes > 0 }}
+        env:
+          AR_REPO: ${{ inputs.ar_repo }}
+          REGION: ${{ inputs.region }}
+          PROJECT: ${{ inputs.project }}
+          WAIT_MINUTES: ${{ inputs.wait_for_repository_minutes }}
+        run: |
+          set -uo pipefail
+
+          if ! [[ "${WAIT_MINUTES}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            echo "::error title=Invalid input::wait_for_repository_minutes must be a non-negative number of minutes, got '${WAIT_MINUTES}'."
+            exit 1
+          fi
+          wait_seconds=$(awk -v m="${WAIT_MINUTES}" 'BEGIN { printf "%d", m * 60 }')
+          interval=30
+          started=$(date +%s)
+          deadline=$((started + wait_seconds))
+          attempt=0
+          kind=""
+          output=""
+
+          while :; do
+            attempt=$((attempt + 1))
+            # `timeout` so that a hung call cannot hold the job until its six-hour limit.
+            if output=$(timeout 120 gcloud artifacts repositories describe "${AR_REPO}" \
+                --location "${REGION}" --project "${PROJECT}" --format='value(name)' 2>&1); then
+              echo "Image Repository ${AR_REPO} is reachable (attempt ${attempt})."
+              exit 0
+            fi
+
+            case "${output}" in
+              *PERMISSION_DENIED*|*"HTTPError 403"*) kind="denied" ;;
+              *NOT_FOUND*|*"HTTPError 404"*) kind="not_found" ;;
+              *INVALID_ARGUMENT*|*"HTTPError 400"*) kind="invalid" ;;
+              *) kind="other" ;;
+            esac
+
+            # A malformed region, project or repository id will not fix itself by waiting.
+            if [ "${kind}" = "invalid" ]; then
+              echo "${output}"
+              echo "::error title=Invalid Image Repository reference::Artifact Registry rejected the request for ${AR_REPO} in ${REGION}/${PROJECT} as invalid. Check the ar_repo, region and project inputs."
+              exit 1
+            fi
+
+            now=$(date +%s)
+            if [ $((now + interval)) -gt "${deadline}" ]; then
+              break
+            fi
+            # Denials and "not found" are both waited on; anything else is most likely
+            # transient (the same STS exchange the auth step retries), so it is too.
+            echo "Attempt ${attempt}: ${kind}; retrying in ${interval}s ($((deadline - now))s left)."
+            sleep "${interval}"
+          done
+
+          waited=$(( $(date +%s) - started ))
+          rerun="gh run rerun ${GITHUB_RUN_ID} --repo ${GITHUB_REPOSITORY}"
+          echo "${output}"
+          echo "::error title=Image Repository not reachable::The Image Repository ${AR_REPO} does not exist, or this repo's identity cannot reach it yet. This is expected until the platform PR that onboards this workload has merged and the repository has been created. Re-run this workflow after that merge: ${rerun}"
+          {
+            echo "## Image Repository not reachable: nothing was built"
+            echo
+            echo "The Image Repository \`${AR_REPO}\` does not exist, or this repo's identity"
+            echo "cannot reach it yet. This is expected until the platform PR that onboards this"
+            echo "workload has merged and ArgoCD has created the repository and its writer binding."
+            echo "This run checked ${attempt} times over ${waited}s and stopped before building."
+            echo
+            echo "**To fix:** re-run this workflow after that PR has merged:"
+            echo
+            echo '```sh'
+            echo "${rerun}"
+            echo '```'
+            echo
+            echo "or use **Re-run jobs** on this run. If the calling workflow has a"
+            echo "\`workflow_dispatch:\` trigger, the **Run workflow** button works too. The check"
+            echo "waits up to ${WAIT_MINUTES} minutes (\`wait_for_repository_minutes\`) for a"
+            echo "repository that is still being created, so a run started straight after the"
+            echo "merge can succeed."
+            echo
+            case "${kind}" in
+              denied)
+                echo "The last answer was a permission error (\`PERMISSION_DENIED\`), not \"not"
+                echo "found\". Artifact Registry gives that answer both for a repository that does not"
+                echo "exist yet and for one whose writer binding is still propagating, so it was"
+                echo "waited on in the same way. If the platform PR merged well before this run"
+                echo "started and the denial persists, the binding may be missing, or this identity"
+                echo "may be allowed to push but not to describe the repository. Set"
+                echo "\`wait_for_repository_minutes: 0\` to skip this check, and report it to the"
+                echo "maintainers of this workflow."
+                ;;
+              not_found)
+                echo "The last answer was \`NOT_FOUND\`: the repository has not been created yet."
+                ;;
+              *)
+                echo "The last answer was an unexpected error, which may be transient."
+                ;;
+            esac
+            echo
+            echo "<details><summary>Last error</summary>"
+            echo
+            echo '```'
+            printf '%s\n' "${output}" | head -n 20
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "${GITHUB_STEP_SUMMARY}"
           exit 1
 
       # Retried for the same reason as the login: the push is the other network hop
@@ -132,30 +278,111 @@ jobs:
           echo "::error::Could not push the image after 3 attempts."
           exit 1
 
-      # Retries make a lost image rarer, not impossible — and a lost image is
-      # invisible from the platform side: the workload simply keeps running its
-      # previous digest. Say plainly what just happened, in the run's annotations
-      # and its summary.
-      #
-      # This workflow cannot open an Issue on the caller's behalf: a called workflow's
-      # GITHUB_TOKEN permissions "can only be maintained or reduced — not elevated"
-      # relative to the caller's, and callers grant only `contents: read` and
-      # `id-token: write`. Requiring `issues: write` here would break every existing
-      # `@v1` caller. Repos that want an Issue add a notify job on their own side —
-      # see the README.
-      - name: Report that the image was not published
-        if: failure()
+      # Read the digest back from the registry rather than from `buildx --metadata-file`:
+      # with the default `docker` builder driver the metadata can carry the local image
+      # id instead of the digest the registry serves, and the registry's answer is the
+      # one a `digest:` pin has to match. The `:<sha>` tag is read, not `:latest`, so a
+      # concurrent build cannot swap the answer. The image is already published at this
+      # point, so a failure to read the digest warns rather than failing the job, which
+      # would otherwise report the image as not published.
+      - name: Record the published digest
+        id: digest
         env:
           IMAGE_BASE: ${{ inputs.region }}-docker.pkg.dev/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}
           SHA: ${{ github.sha }}
         run: |
-          echo "::error title=Image not published — this workload is now stale::No image was pushed for ${SHA}. The platform keeps serving the previously published digest until a later commit publishes successfully."
+          set -uo pipefail
+          echo "image=${IMAGE_BASE}" >> "${GITHUB_OUTPUT}"
+          digest=""
+          for attempt in 1 2 3; do
+            if manifest=$(docker buildx imagetools inspect "${IMAGE_BASE}:${SHA}" --format '{{json .Manifest}}') \
+              && candidate=$(jq -er '.digest' <<<"${manifest}") \
+              && [[ "${candidate}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              digest="${candidate}"
+              break
+            fi
+            echo "Could not read the digest (attempt ${attempt}/3); retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+
+          if [ -z "${digest}" ]; then
+            echo "::warning title=Digest not recorded::The image was pushed, but its digest could not be read back from the registry. Look it up with: gcloud artifacts docker images describe ${IMAGE_BASE}:${SHA} --format='value(image_summary.digest)'"
+            {
+              echo "## Image published"
+              echo
+              echo "\`${IMAGE_BASE}:${SHA}\` (also \`:latest\`) was pushed, but its digest could"
+              echo "not be read back from the registry, so the \`digest\` output is empty. Look it up"
+              echo "with:"
+              echo
+              echo '```sh'
+              echo "gcloud artifacts docker images describe ${IMAGE_BASE}:${SHA} --format='value(image_summary.digest)'"
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "Published ${IMAGE_BASE}:${SHA} as ${digest}."
           {
-            echo "## Image not published — this workload is now stale"
+            echo "## Image published"
             echo
-            echo "No image was pushed for \`${SHA}\`, so the platform keeps serving the"
-            echo "**previously published digest**. Deploying a fix requires a successful push;"
-            echo "a green \`main\` does not mean the running workload contains this commit."
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${IMAGE_BASE}\` |"
+            echo "| Digest | \`${digest}\` |"
+            echo "| Tags | \`${SHA}\`, \`latest\` |"
+            echo
+            echo "### Pinning this image"
+            echo
+            echo "A workload that Image Updater tracks picks this digest up from \`:latest\` by"
+            echo "itself: there is nothing to do. A workload that it does not track"
+            echo "(\`autoUpdate: false\`, or \`tier: prod\`) is not pinned to it: its"
+            echo "\`kustomization.yaml\` keeps what it names, often the bootstrap \`newTag: latest\`,"
+            echo "until a reviewed platform PR pins a digest. The \`images:\` entry for this build is:"
+            echo
+            echo '```yaml'
+            echo "images:"
+            echo "- name: ${IMAGE_BASE}"
+            echo "  digest: ${digest}"
+            echo '```'
+            echo
+            echo "To write it from a checkout of the platform repo:"
+            echo
+            echo '```sh'
+            echo "make pin WORKLOAD=tenants/<tenant>/<kind>/<name> DIGEST=${digest}"
+            echo '```'
+            echo
+            echo "Replace \`tenants/<tenant>/<kind>/<name>\` with the workload's directory, which"
+            echo "this workflow does not know. The post-merge bot comment on the platform PR that"
+            echo "onboarded the workload also prints this command, with the path filled in."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      # Retries make a lost image rarer, not impossible, and a lost image is invisible
+      # from the platform side: the workload simply keeps running its previous image,
+      # or, on a first build, has none to run. Say plainly what just happened, in the
+      # run's annotations and its summary. A failed preflight has already written its
+      # own, more specific, report.
+      #
+      # This workflow cannot open an Issue on the caller's behalf: a called workflow's
+      # GITHUB_TOKEN permissions "can only be maintained or reduced, not elevated"
+      # relative to the caller's, and callers grant only `contents: read` and
+      # `id-token: write`. Requiring `issues: write` here would break every existing
+      # `@v1` caller. Repos that want an Issue add a notify job on their own side:
+      # see the README.
+      - name: Report that the image was not published
+        if: failure() && steps.preflight.outcome != 'failure'
+        env:
+          IMAGE_BASE: ${{ inputs.region }}-docker.pkg.dev/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}
+          SHA: ${{ github.sha }}
+        run: |
+          echo "::error title=Image not published::No image was pushed for ${SHA}. The workload keeps running its previous image if it has one; on a first build it has none yet. Re-run this job to recover."
+          {
+            echo "## Image not published"
+            echo
+            echo "No image was pushed for \`${SHA}\`. If the workload already runs an earlier"
+            echo "image, the platform keeps serving that one; if this was its first build, no image"
+            echo "exists yet and the workload cannot start until one is published. Either way, a"
+            echo "green \`main\` does not mean the running workload contains this commit."
             echo
             echo "| | |"
             echo "|---|---|"
@@ -163,8 +390,14 @@ jobs:
             echo "| Image | \`${IMAGE_BASE}\` |"
             echo
             echo "**To recover:** re-run this job. A later commit that publishes cleanly also"
-            echo "heals it, because its image contains this commit as an ancestor — but nothing"
+            echo "heals it, because its image contains this commit as an ancestor, but nothing"
             echo "guarantees a later commit arrives."
+            echo
+            echo "If the push failed with \`denied: Permission"
+            echo "'artifactregistry.repositories.uploadArtifacts' denied ... (or it may not"
+            echo "exist)\`, the Image Repository or this repo's access to it does not exist yet."
+            echo "That is expected until the platform PR that onboards this workload has merged:"
+            echo "re-run this job after the merge."
             echo
             echo "If the failure was \`Unable to retrieve Identity Pool subject token\` /"
             echo "\`reset reason: overflow\`, that is a transient Workload Identity Federation"
