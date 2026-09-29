@@ -36,8 +36,36 @@ Outputs, for a later job in the calling workflow (`needs.image.outputs.<name>`):
 | `digest` | The digest the registry serves for the pushed image, `sha256:...`. Empty if the push succeeded but the digest could not be read back; the run then says so with a warning. |
 | `image` | The image path without tag or digest, `<region>-docker.pkg.dev/<project>/<ar_repo>/<image>`. |
 
-A successful run's job summary shows the image, the digest, the commit SHA tag, and a
-ready-to-paste kustomization `images:` entry that pins the digest.
+A successful run's job summary shows the image, the digest, the tags it pushed (and why
+`:latest` was or was not one of them), and a ready-to-paste kustomization `images:` entry
+that pins the digest.
+
+## Tags: `:latest` follows the default branch only
+
+Every build pushes `<image>:<commit-sha>`. `<image>:latest` is pushed **only** when the
+build runs on the calling repository's default branch, that is when `github.ref` is
+`refs/heads/<default branch>`. A workload that follows the digest behind `:latest`
+(`track: digest` on the hosting platform) therefore follows the default branch, and
+nothing else.
+
+| The calling run was started by | `:<sha>` | `:latest` |
+|---|---|---|
+| A push to the default branch, or **Run workflow** (`workflow_dispatch`) on it | yes | yes |
+| A push to, or **Run workflow** on, any other branch | yes | no |
+| `pull_request`, a tag push, a merge queue run | yes | no |
+| An event whose payload does not carry the repository's default branch (for example `schedule`) | yes | no |
+
+The default branch is read from the caller's event payload
+(`github.event.repository.default_branch`). `push`, `workflow_dispatch` and
+`pull_request` payloads carry it; where an event's payload does not, the build is still
+pushed as `:<sha>`, `:latest` is left where it was, and the run says so with a notice. To
+move `:latest`, run the build from the default branch.
+
+A build that did not move `:latest` is not rolled out to a tracked workload, and pinning
+its digest by hand does not hold: Image Updater writes the digest behind `:latest` back on
+its next check. An untracked workload can be pinned to any `:<sha>` build's digest.
+
+Before v1.3.0 every build moved `:latest`, whatever branch it ran on.
 
 ## Before the platform PR merges: `wait_for_repository_minutes`
 

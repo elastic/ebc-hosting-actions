@@ -17,6 +17,10 @@
 #         image: <image-name>
 #         project: <gcp-project>
 #         wif_provider: <workload-identity-provider-resource-name>
+#
+# Tags: every build pushes `:<commit-sha>`. `:latest` is pushed only when the build
+# runs on the calling repository's default branch, so a workload that follows the
+# digest behind `:latest` follows that branch and nothing else. See "Decide the tags".
 name: build-push-image
 
 on:
@@ -251,6 +255,48 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
           exit 1
 
+      # `:latest` is what a `track: digest` workload follows (Image Updater resolves the
+      # digest behind it), so it must only ever name a build of the default branch.
+      # Before v1.3.0 every build moved it: a `workflow_dispatch` on a feature branch,
+      # or a caller whose `on:` also listed other branches, silently rolled that branch
+      # out, and every pod start of a workload still on `newTag: latest` pulled it too.
+      #
+      # In a called workflow the `github` context is the caller's, so `github.ref` is
+      # the ref the calling run was started on, and `github.event` is the caller's
+      # event payload. `repository.default_branch` is in the payload of `push`,
+      # `workflow_dispatch`, `pull_request`, `release`, `repository_dispatch` and
+      # `workflow_run` events, among others. It is not guaranteed for every event (a
+      # `schedule` payload, for one, is not documented to carry `repository`). When it
+      # is missing the build is still pushed as `:<sha>`, `:latest` is left alone, and
+      # the run says so: a missing default branch never moves `:latest`.
+      #
+      # `pull_request` runs (ref `refs/pull/<n>/merge`), tag pushes (`refs/tags/...`)
+      # and merge queue runs (`refs/heads/gh-readonly-queue/...`) never match, so none
+      # of them move `:latest` either.
+      - name: Decide the tags
+        id: tags
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -uo pipefail
+          if [ -z "${DEFAULT_BRANCH}" ]; then
+            latest=false
+            reason="the \`${EVENT}\` event that started this run does not say which branch is the repository's default, so \`:latest\` was left where it was"
+            echo "::notice title=:latest not moved::The ${EVENT} event does not carry the repository's default branch, so only :<sha> is pushed. Run the build from a push to, or a workflow_dispatch on, the default branch to move :latest."
+          elif [ "${REF}" = "refs/heads/${DEFAULT_BRANCH}" ]; then
+            latest=true
+            reason="this run built the default branch \`${DEFAULT_BRANCH}\`"
+          else
+            latest=false
+            reason="this run built \`${REF}\`, not the default branch \`${DEFAULT_BRANCH}\`, so \`:latest\` was left where it was"
+            echo "::notice title=:latest not moved::Built ${REF}, not the default branch ${DEFAULT_BRANCH}: only :<sha> is pushed, and workloads that follow :latest do not pick this build up."
+          fi
+          echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
+          echo "reason=${reason}" >> "${GITHUB_OUTPUT}"
+          echo "Tag :latest: ${latest} (${reason})."
+
       # Retried for the same reason as the login: the push is the other network hop
       # whose loss is silent. Rebuilds hit the layer cache, so a retry costs the
       # push rather than the build.
@@ -260,12 +306,16 @@ jobs:
           SHA: ${{ github.sha }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           CONTEXT: ${{ inputs.context }}
+          TAG_LATEST: ${{ steps.tags.outputs.latest }}
         run: |
           set -uo pipefail
+          tags=(--tag "${IMAGE_BASE}:${SHA}")
+          if [ "${TAG_LATEST}" = "true" ]; then
+            tags+=(--tag "${IMAGE_BASE}:latest")
+          fi
           for attempt in 1 2 3; do
             if docker buildx build \
-              --tag "${IMAGE_BASE}:${SHA}" \
-              --tag "${IMAGE_BASE}:latest" \
+              "${tags[@]}" \
               --file "${DOCKERFILE}" \
               --push \
               "${CONTEXT}"; then
@@ -291,9 +341,18 @@ jobs:
         env:
           IMAGE_BASE: ${{ inputs.region }}-docker.pkg.dev/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}
           SHA: ${{ github.sha }}
+          TAG_LATEST: ${{ steps.tags.outputs.latest }}
+          LATEST_REASON: ${{ steps.tags.outputs.reason }}
         run: |
           set -uo pipefail
           echo "image=${IMAGE_BASE}" >> "${GITHUB_OUTPUT}"
+          if [ "${TAG_LATEST}" = "true" ]; then
+            tags_line="\`${SHA}\`, \`latest\`"
+            also=" (also \`:latest\`)"
+          else
+            tags_line="\`${SHA}\` only (not \`latest\`)"
+            also=" (not \`:latest\`)"
+          fi
           digest=""
           for attempt in 1 2 3; do
             if manifest=$(docker buildx imagetools inspect "${IMAGE_BASE}:${SHA}" --format '{{json .Manifest}}') \
@@ -311,9 +370,9 @@ jobs:
             {
               echo "## Image published"
               echo
-              echo "\`${IMAGE_BASE}:${SHA}\` (also \`:latest\`) was pushed, but its digest could"
-              echo "not be read back from the registry, so the \`digest\` output is empty. Look it up"
-              echo "with:"
+              echo "\`${IMAGE_BASE}:${SHA}\`${also} was pushed, but its digest could"
+              echo "not be read back from the registry, so the \`digest\` output is empty. The"
+              echo "\`:latest\` decision: ${LATEST_REASON}. Look the digest up with:"
               echo
               echo '```sh'
               echo "gcloud artifacts docker images describe ${IMAGE_BASE}:${SHA} --format='value(image_summary.digest)'"
@@ -331,15 +390,25 @@ jobs:
             echo "|---|---|"
             echo "| Image | \`${IMAGE_BASE}\` |"
             echo "| Digest | \`${digest}\` |"
-            echo "| Tags | \`${SHA}\`, \`latest\` |"
+            echo "| Tags | ${tags_line} |"
+            echo
+            echo "\`:latest\` is pushed only from the repository's default branch: ${LATEST_REASON}."
             echo
             echo "### Pinning this image"
             echo
-            echo "A workload that Image Updater tracks picks this digest up from \`:latest\` by"
-            echo "itself: there is nothing to do. A workload that it does not track"
-            echo "(\`autoUpdate: false\`, or \`tier: prod\`) is not pinned to it: its"
-            echo "\`kustomization.yaml\` keeps what it names, often the bootstrap \`newTag: latest\`,"
-            echo "until a reviewed platform PR pins a digest. The \`images:\` entry for this build is:"
+            if [ "${TAG_LATEST}" = "true" ]; then
+              echo "A workload that Image Updater tracks (\`track: digest\`) picks this digest up"
+              echo "from \`:latest\` by itself: there is nothing to do."
+            else
+              echo "This build did not move \`:latest\`, so a workload that Image Updater tracks"
+              echo "(\`track: digest\`) does **not** pick it up: it keeps following the default"
+              echo "branch, and a digest pinned by hand is replaced by the digest behind \`:latest\`"
+              echo "on Image Updater's next check."
+            fi
+            echo "A workload that Image Updater does not track (for example \`autoUpdate: false\`)"
+            echo "is not pinned to it: its \`kustomization.yaml\` keeps what it names, often the"
+            echo "bootstrap \`newTag: latest\`, until a reviewed platform PR pins a digest. The"
+            echo "\`images:\` entry for this build is:"
             echo
             echo '```yaml'
             echo "images:"
